@@ -199,8 +199,16 @@ end
         @test size(@inferred(xcorr(x, su))) == (19,)
     end
 
-    # xcorr only supports 1d inputs at the moment
-    @test_throws MethodError xcorr(rand(2, 2), rand(2, 2))
+    @testset "xcorr-2d" begin
+        a = [1 2 3; 1 2 3]
+        b = [4 5; 4 5]
+        exp = [5 14 23 12; 10 28 46 24; 5 14 23 12]
+        @test xcorr(a, b, padmode = :none) == exp
+        off_a = OffsetArray(a, -1:0, -1:1)
+        off_b = OffsetArray(b, -1:0, 0:1)
+        @test xcorr(off_a, off_b, padmode = :none) ==
+            OffsetArray(exp, -1:1, -2:1)
+    end
 
     off_a = OffsetVector(a, -1:1)
     off_b = OffsetVector(b, 0:1)

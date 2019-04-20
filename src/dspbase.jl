@@ -269,15 +269,28 @@ function check_padmode_kwarg(padmode::Symbol, su::Integer, sv::Integer)
     end
 end
 
-dsp_reverse(v, ::NTuple{<:Any, Base.OneTo{Int}}) = reverse(v, dims = 1)
-function dsp_reverse(v, vaxes)
-    vsize = length(v)
-    reflected_start = - first(vaxes[1]) - vsize + 1
-    reflected_axes = (reflected_start : reflected_start + vsize - 1,)
-    out = similar(v, reflected_axes)
-    copyto!(out, reflected_start, Iterators.reverse(v), 1, vsize)
+function dsp_reverse(v, ::NTuple{<:Any, Base.OneTo{Int}})
+    nv = length(v)
+    out = similar(v)
+    @inbounds for i in 1:nv
+        out[i] = v[nv - i + 1]
+    end
+    out
 end
-
+function dsp_reverse(v, vaxes)
+    vsize = size(v)
+    nv = prod(vsize)
+    reflected_start = .- first.(vaxes) .- vsize .+ 1
+    reflected_axes = UnitRange.(
+        reflected_start, reflected_start .+ vsize .- 1
+    )
+    out = similar(v, reflected_axes)
+    @inbounds for i in 1:nv
+        out[i] = v[nv - i + 1]
+    end
+    out
+end
+dsp_reverse(v) = dsp_reverse(v, axes(v))
 
 """
     xcorr(u,v; padmode = :longest)
@@ -298,7 +311,7 @@ with the zero-lag condition at the center.
     `padmode` unspecified is currently deprecated.
 """
 function xcorr(
-    u::AbstractVector, v::AbstractVector; padmode::Symbol = :default_longest
+    u::AbstractArray, v::AbstractArray; padmode::Symbol = :default_longest
 )
     su = size(u,1); sv = size(v,1)
     padmode = check_padmode_kwarg(padmode, su, sv)
@@ -308,9 +321,9 @@ function xcorr(
         elseif sv < su
             v = _zeropad(v, su)
         end
-        conv(u, dsp_reverse(conj(v), axes(v)))
+        conv(u, dsp_reverse(conj(v)))
     elseif padmode == :none
-        conv(u, dsp_reverse(conj(v), axes(v)))
+        conv(u, dsp_reverse(conj(v)))
     else
         throw(ArgumentError("padmode keyword argument must be either :none or :longest"))
     end
