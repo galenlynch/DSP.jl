@@ -482,6 +482,25 @@ function _conv_fft!(out, u, v, su, sv, outsize)
     end
 end
 
+function _conv_kern_direct!(out, u, v)
+    fill!(out, 0)
+    u_region = CartesianIndices(u)
+    v_region = CartesianIndices(v)
+    one_index = oneunit(first(u_region))
+    @inbounds for vindex in v_region
+        @simd for uindex in u_region
+            out[uindex + vindex - one_index] += u[uindex] * v[vindex]
+        end
+    end
+    out
+end
+
+function _conv_kern_direct(
+    u::AbstractArray{T, N}, v::AbstractArray{S, N}, su, sv) where {T, S, N}
+    sout = su .+ sv .- 1
+    out = similar(u, promote_type(T, S), sout)
+    _conv_kern_direct!(out, u, v)
+end
 
 # For arrays with weird offsets
 function _conv_similar(u, outsize, axesu, axesv)
