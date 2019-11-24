@@ -657,7 +657,7 @@ function filt!(
 
         # Used to have @inbounds. Restore @inbounds if buffer length
         # can be verified prior to access.
-        buffer[bufIdx] = yLower + yUpper * kernel.α
+        buffer[bufIdx] = yLower + yUpper * kernel.α # BUG
         update(kernel)
     end
 

@@ -44,6 +44,13 @@ using Test
     y4_ml = vec(readdlm(joinpath(dirname(@__FILE__), "data", "resample_y_2_3.txt"),'\t'))
     y4_jl = resample(x_ml, rate, h4_ml)
     @test y4_jl ≈ y4_ml
+
+    # check for indexing error in #317
+    N = 35546
+    rate = 1/55.55
+    nout = convert(Int, ceil(N * rate))
+    a = zeros(N)
+    @test zeros(nout) ≈ resample(a, rate)
 end
 
 @testset "irrational ratio" begin
