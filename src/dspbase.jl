@@ -2,6 +2,7 @@
 
 import Base: trailingsize
 import LinearAlgebra.BLAS
+import IterTools: @ifsomething
 
 const SMALL_FILT_CUTOFF = 58
 
@@ -355,6 +356,8 @@ end
     buff .*= filter_fd
     ip! * buff # ip! operates in place on buff
 end
+
+
 
 # Used by `unsafe_conv_kern_os!` to handle blocks of input data that need to be padded.
 #
@@ -809,3 +812,39 @@ function xcorr(
         throw(ArgumentError("padmode keyword argument must be either :none or :longest"))
     end
 end
+
+struct EdgeIter{N}
+    edge_ranges::NTuple{N, Vector{UnitRange{Int}}}
+    center_ranges::NTuple{N, UnitRange{Int}}
+    all_dims::UnitRange{Int}
+    perimeter_range::Vector{UnitRange{Int}}
+end
+
+function iterate(iter::EdgeIter{N}) where N
+    N == 0 && return nothing
+    iterate(iter, n_edges, nothing, nothing, nothing)
+end
+
+function iterate(iter::EdgeIter{N}, state = (0, nothing, nothing, nothing)) where N
+    n_edges, subs_iter, prod_iter, cart_iter = state
+    if subs_iter === nothing
+        if n_edges == N
+            return nothing
+        else
+            n_edges += 1
+            subs_iter = subsets(iter.all_dims, Val(n_edges))
+        end
+    end
+    if cart_iter === nothing
+        if prod_iter === nothing
+                
+            else
+            end
+        else
+        end
+    else
+    end
+    edge_dims, subs_state = @ifsomething iterate(subs_iter)
+    copyto!
+end
+
