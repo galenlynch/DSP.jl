@@ -1,9 +1,15 @@
 # This file was formerly a part of Julia. License is MIT: https://julialang.org/license
 
-import Base: trailingsize
+import Base: trailingsize, tail
 import LinearAlgebra.BLAS
+using LinearAlgebra: dot
+
+import Base.Threads.@spawn
+import Base.OneTo
 
 const SMALL_FILT_CUTOFF = 58
+
+const NormalAxes{N} = NTuple{N, OneTo{Int}}
 
 _zerosi(b,a,T) = zeros(promote_type(eltype(b), eltype(a), T), max(length(a), length(b))-1)
 
@@ -71,7 +77,7 @@ function filt!(out::AbstractArray, b::Union{AbstractVector, Number}, a::Union{Ab
         elseif bs <= SMALL_FILT_CUTOFF
             _small_filt_fir!(out, b, x, si, col)
         else
-            _filt_fir!(out, b, x, si, col)
+            _filt_fir!(out, b, x, si, col, silen)
         end
     end
     return out
@@ -91,17 +97,46 @@ function _filt_iir!(out, b, a, x, si, col)
     end
 end
 
+function _filt_fir_row_thread_exec!(out, b, x, si_init, sibuffs, col, silen,
+                                    input_range, xa, usesmall, tno_override = 0)
+    tno = tno_override > 0 ? tno_override : Threads.threadid()
+    sibuff = sibuffs[tno]
+    ib = first(input_range)
+    target_warm_b = ib - silen
+    warm_deficit = max(first(xa[1]) - target_warm_b, 0)
+    warm_range = target_warm_b + warm_deficit : ib - 1
+    if warm_deficit > 0
+        si_offset = silen - warm_deficit + 1
+        copyto!(sibuff, si_offset, si_init, si_offset, warm_deficit)
+    end
+    _filt_fir_warm!(b, x, sibuff, col, silen, warm_range)
+    if usesmall
+        _small_filt_fir!(out, b, x, sibuff, col, input_range)
+    else
+        _filt_fir!(out, b, x, sibuff, col, silen, input_range)
+    end
+end
+
 # Transposed direct form II
-function _filt_fir!(out, b, x, si, col)
-    silen = length(si)
-    @inbounds for i=1:size(x, 1)
+function _filt_fir!(out, b, x, si, col,
+                    silen = size(si, 1), input_range = 1:size(x, 1))
+    @inbounds for i in input_range
         xi = x[i,col]
-        val = muladd(xi, b[1], si[1])
+        out[i,col] = muladd(xi, b[1], si[1])
         for j=1:(silen-1)
             si[j] = muladd(xi, b[j+1], si[j+1])
         end
         si[silen] = b[silen+1]*xi
-        out[i,col] = val
+    end
+end
+
+function _filt_fir_warm!(b, x, si, col, silen, input_range)
+    @inbounds for i in input_range
+        xi = x[i,col]
+        for j=1:(silen-1)
+            si[j] = muladd(xi, b[j+1], si[j+1])
+        end
+        si[silen] = b[silen+1]*xi
     end
 end
 
@@ -113,17 +148,18 @@ for n = 2:SMALL_FILT_CUTOFF
     silen = n-1
     si = [Symbol("si$i") for i = 1:silen]
     # Transposed direct form II
-    @eval function _filt_fir!(out, b::NTuple{$n,T}, x, siarr, col) where {T}
-        offset = (col - 1) * size(x, 1)
+    @eval function _filt_fir!(out, b::NTuple{$n}, x, siarr, col, input_range, xstride, outstride)
+        x_offset = (col - 1) * xstride
+        o_offset = (col - 1) * outstride
 
         $(Expr(:block, [:(@inbounds $(si[i]) = siarr[$i]) for i = 1:silen]...))
-        @inbounds for i=1:size(x, 1)
-            xi = x[i+offset]
-            val = muladd(xi, b[1], $(si[1]))
+        @inbounds for i in input_range
+            xi = x[i+x_offset]
+            out[i+o_offset] = muladd(xi, b[1], $(si[1]))
             $(Expr(:block, [:($(si[j]) = muladd(xi, b[$(j+1)], $(si[j+1]))) for j = 1:(silen-1)]...))
             $(si[silen]) = b[$(silen+1)]*xi
-            out[i+offset] = val
         end
+        $(Expr(:block, [:(@inbounds siarr[$i] = $(si[i])) for i = 1:silen]...))
     end
 end
 
@@ -137,7 +173,10 @@ let chain = :(throw(ArgumentError("invalid tuple size")))
                     ($([:(@inbounds(h[$i])) for i = 1:n]...),),
                     x,
                     si,
-                    col
+                    col,
+                    input_range,
+                    xstride,
+                    outstride
                 )
             else
                 $chain
@@ -146,8 +185,15 @@ let chain = :(throw(ArgumentError("invalid tuple size")))
     end
 
     @eval function _small_filt_fir!(
-        out::AbstractArray, h::AbstractVector{T}, x::AbstractArray, si, col
-    ) where T
+        out::AbstractArray,
+        h::AbstractVector,
+        x::AbstractArray,
+        si,
+        col,
+        input_range = 1:size(x, 1),
+        xstride = size(x, 1),
+        outstride = size(out, 1)
+    )
         $chain
     end
 end
@@ -239,7 +285,7 @@ function _zeropad_keep_offset(u, padded_size, u_axes, args...)
 end
 
 function _zeropad_keep_offset(
-    u, padded_size, ::NTuple{<:Any, Base.OneTo{Int}}, args...
+    u, padded_size, ::NormalAxes, args...
 )
     _zeropad(u, padded_size, args...)
 end
@@ -295,8 +341,27 @@ fdbuff may be an alias of each other, because complex convolution only requires
 one buffer. The plans are mutating where possible, and the inverse plan is
 unnormalized.
 """
-@inline function os_prepare_conv(u::AbstractArray{T, N},
-                                 nffts) where {T<:Real, N}
+struct ConvOSThreadBuffers{T, A, B, P, I}
+    tdbuff::A
+    fdbuff::B
+    p::P
+    ip::I
+end
+
+function ConvOSThreadBuffers(
+    ::Type{T}, tdbuff::A, fdbuff::B, p::P, ip::I
+) where {T<:Real, A<:AbstractArray, B<:AbstractArray, P, I}
+    ConvOSThreadBuffers{T, A, B, P, I}(tdbuff, fdbuff, p, ip)
+end
+
+function ConvOSThreadBuffers(
+    ::Type{T}, buff::A, p::P, ip::I
+) where {T<:Complex, A<:AbstractArray, P, I}
+    ConvOSThreadBuffers{T, A, A, P, I}(buff, buff, p, ip)
+end
+
+function ConvOSThreadBuffers(u::AbstractArray{T, N},
+                             nffts) where {T<:Real, N}
     tdbuff = similar(u, nffts)
     bufsize = ntuple(i -> i == 1 ? nffts[i] >> 1 + 1 : nffts[i], N)
     fdbuff = similar(u, Complex{T}, NTuple{N, Int}(bufsize))
@@ -304,16 +369,14 @@ unnormalized.
     p = plan_rfft(tdbuff)
     ip = plan_brfft(fdbuff, nffts[1])
 
-    tdbuff, fdbuff, p, ip
+    ConvOSThreadBuffers(T, tdbuff, fdbuff, p, ip)
 end
 
-@inline function os_prepare_conv(u::AbstractArray{<:Complex}, nffts)
+function ConvOSThreadBuffers(u::AbstractArray{T}, nffts) where T <: Complex
     buff = similar(u, nffts)
-
     p = plan_fft!(buff)
     ip = plan_bfft!(buff)
-
-    buff, buff, p, ip # Only one buffer for complex
+    ConvOSThreadBuffers(T, buff, p, ip)
 end
 
 """
@@ -333,25 +396,17 @@ Take a block of data, and convolve it with the smaller convolution input. This
 may modify the contents of `tdbuff` and `fdbuff`, and the result will be in
 `tdbuff`.
 """
-@inline function os_conv_block!(tdbuff::AbstractArray{<:Real},
-                                fdbuff::AbstractArray,
-                                filter_fd,
-                                p,
-                                ip)
-    mul!(fdbuff, p, tdbuff)
-    fdbuff .*= filter_fd
-    mul!(tdbuff, ip, fdbuff)
+@inline function os_conv_block!(buffs::ConvOSThreadBuffers{<:Real}, filter_fd)
+    unsafe_execute!(buffs.p, buffs.tdbuff, buffs.fdbuff)
+    buffs.fdbuff .*= filter_fd
+    unsafe_execute!(buffs.ip, buffs.fdbuff, buffs.tdbuff)
 end
 
 "Like the real version, but only operates on one buffer"
-@inline function os_conv_block!(buff::AbstractArray{<:Complex},
-                                ::AbstractArray, # Only one buffer for complex
-                                filter_fd,
-                                p!,
-                                ip!)
-    p! * buff # p! operates in place on buff
-    buff .*= filter_fd
-    ip! * buff # ip! operates in place on buff
+@inline function os_conv_block!(buffs::ConvOSThreadBuffers{<:Complex}, filter_fd)
+    unsafe_execute!(buffs.p, buffs.tdbuff, buffs.tdbuff)
+    buffs.tdbuff .*= filter_fd
+    unsafe_execute!(buffs.ip, buffs.tdbuff, buffs.tdbuff)
 end
 
 # Used by `unsafe_conv_kern_os!` to handle blocks of input data that need to be padded.
@@ -367,20 +422,16 @@ end
 # the number of edges with Val{n} is inherently type unstable, so this function
 # boundary allows dispatch to make efficient code for each number of edge
 # dimensions.
-function unsafe_conv_kern_os_edge!(
+function _conv_os_edge!(
     # These arrays and buffers will be mutated
     out::AbstractArray{<:Any, N},
-    tdbuff,
-    fdbuff,
+    os_thread_buff,
     perimeter_range,
     # Number of edge dimensions to pad and convolve
     n_edges::Val,
     # Data to be convolved
     u,
     filter_fd,
-    # FFTW plans
-    p,
-    ip,
     # Sizes, ranges, and other pre-calculated constants
     #
     ## ranges listing center and edge blocks
@@ -410,7 +461,7 @@ function unsafe_conv_kern_os_edge!(
         # on an edge.
         #
         # First make all entries equal to the center blocks:
-        @inbounds copyto!(perimeter_range, 1, center_block_ranges, 1, N)
+        copyto!(perimeter_range, 1, center_block_ranges, 1, N)
 
         # For the dimensions chosen to be on an edge (edge_dims), get the
         # ranges of the blocks that would need to be padded (lie on an edge)
@@ -460,8 +511,8 @@ function unsafe_conv_kern_os_edge!(
 
                 # Convolve portion of input
 
-                _zeropad!(tdbuff, u, tdbuff_axes, pad_before .+ 1, data_region)
-                os_conv_block!(tdbuff, fdbuff, filter_fd, p, ip)
+                _zeropad!(os_thread_buff.tdbuff, u, tdbuff_axes, pad_before .+ 1, data_region)
+                os_conv_block!(os_thread_buff, filter_fd)
 
                 # Save convolved result to output
 
@@ -478,7 +529,7 @@ function unsafe_conv_kern_os_edge!(
                 valid_buff_region = CartesianIndices(
                     UnitRange.(sv, nffts .- u_deficit .- sout_deficit)
                 )
-                copyto!(out, block_out_region, tdbuff, valid_buff_region)
+                copyto!(out, block_out_region, os_thread_buff.tdbuff, valid_buff_region)
             end
         end
     end
@@ -486,13 +537,8 @@ end
 
 # Assumes u is larger than, or the same size as, v
 # nfft should be greater than or equal to 2*sv-1
-function unsafe_conv_kern_os!(out,
-                        u::AbstractArray{<:Any, N},
-                        v,
-                        su,
-                        sv,
-                        sout,
-                        nffts) where N
+function _conv_os!(out, u::AbstractArray{<:Any, N}, v, su, sv, sout, nffts;
+                   nt = 1) where N
     u_start = first.(axes(u))
     out_axes = axes(out)
     out_start = first.(out_axes)
@@ -506,18 +552,19 @@ function unsafe_conv_kern_os!(out,
     nblocks = cld.(sout, save_blocksize)
 
     # Pre-allocation
-    tdbuff, fdbuff, p, ip = os_prepare_conv(u, nffts)
+    os_thread_buff = ConvOSThreadBuffers(u, nffts)
+    tdbuff = os_thread_buff.tdbuff
     tdbuff_axes = axes(tdbuff)
 
     # Transform the smaller filter
     _zeropad!(tdbuff, v)
-    filter_fd = os_filter_transform!(tdbuff, p)
-    filter_fd .*= 1 / prod(nffts) # Normalize once for brfft
+    filter_fd = os_filter_transform!(os_thread_buff.tdbuff, os_thread_buff.p)
+    filter_fd .*= 1 / prod(nffts) # Normalize once for bfft
 
     # block indices for center blocks, which need no padding
     first_center_blocks = cld.(sv .- 1, save_blocksize) .+ 1
     last_center_blocks = fld.(su, save_blocksize)
-    center_block_ranges = UnitRange.(first_center_blocks, last_center_blocks)
+    center_block_range = UnitRange.(first_center_blocks, last_center_blocks)
 
     # block index ranges for blocks that need to be padded
     # Corresponds to the leading and trailing side of a dimension, or if there
@@ -542,25 +589,21 @@ function unsafe_conv_kern_os!(out,
     #                         3 | Corners of Cube
     #
     for n_edges in all_dims
-        unsafe_conv_kern_os_edge!(
+        _conv_os_edge!(
             # These arrays and buffers will be mutated
             out,
-            tdbuff,
-            fdbuff,
+            os_thread_buff,
             perimeter_range,
             # Number of edge dimensions to pad and convolve
             Val(n_edges),
             # Data to be convolved
             u,
             filter_fd,
-            # FFTW plans
-            p,
-            ip,
             # Sizes, ranges, and other pre-calculated constants
             #
             ## ranges listing center and edge blocks
             edge_ranges,
-            center_block_ranges,
+            center_block_range,
             ## size and axis information
             all_dims, # 1:N
             su,
@@ -574,14 +617,78 @@ function unsafe_conv_kern_os!(out,
             tdbuff_axes) # How many output samples are missing if nffts > sout
     end
 
-    tdbuff_region = CartesianIndices(tdbuff)
+    _conv_os_core!(
+        out, os_thread_buff, filter_fd, u, sv, nffts, u_start, out_start,
+        center_block_range, save_blocksize, nt
+    )
+
+    out
+end
+
+function _conv_os_core!(out, os_thread_buff, filter_fd, u, sv, nffts, u_start,
+                        out_start, center_block_range, save_blocksize, nt)
+    center_block_region = CartesianIndices(center_block_range)
+    isempty(center_block_region) && return
+    tdbuff_region = CartesianIndices(os_thread_buff.tdbuff)
     # Portion of buffer with valid result of convolution
     valid_buff_region = CartesianIndices(UnitRange.(sv, nffts))
-    # Iterate over block indices (not data indices) that do not need to be padded
-    @inbounds for block_pos in CartesianIndices(center_block_ranges)
-        # Calculate portion of data to transform
+    if nt == 1
+        _conv_os_core_kern!(
+            out, os_thread_buff, filter_fd, u, sv, nffts, u_start,
+            out_start, center_block_region, save_blocksize, tdbuff_region,
+            valid_buff_region
+        )
+    else
+        nsysthr = Threads.nthreads()
+        rsi = RegionSplitIter(center_block_region, nt)
+        nchunk = length(rsi)
+        tasks = Vector{Task}(undef, nchunk - 1)
+        # Make buffers and fftw plans for each thread
+        os_buffs = Vector{typeof(os_thread_buff)}(undef, nsysthr)
+        os_buffs[Threads.threadid()] = os_thread_buff
+        for tno in 1:nsysthr
+            if !isassigned(os_buffs, tno)
+                os_buffs[tno] = ConvOSThreadBuffers(u, nffts)
+            end
+        end
+        for (cno, chunk_regions) in enumerate(rsi)
+            if cno < nchunk
+                tasks[cno] = @spawn(
+                    _conv_os_core_kern_texec!(
+                        out, os_buffs, filter_fd, u, sv, nffts, u_start,
+                        out_start, chunk_regions, save_blocksize, tdbuff_region,
+                        valid_buff_region
+                    )
+                )
+            else
+                _conv_os_core_kern_texec!(
+                    out, os_buffs, filter_fd, u, sv, nffts, u_start,
+                    out_start, chunk_regions, save_blocksize, tdbuff_region,
+                    valid_buff_region
+                )
+            end
+        end
+        foreach(wait, tasks)
+    end
+end
 
-        block_idx = convert(NTuple{N, Int}, block_pos)
+function _conv_os_core_kern_texec!(out, os_thread_buffs, filter_fd, u, sv,
+                                   nffts, u_start, out_start, chunk_regions,
+                                   args...)
+    buff = os_thread_buffs[Threads.threadid()]
+    for chunk in chunk_regions
+        _conv_os_core_kern!(out, buff, filter_fd, u, sv, nffts, u_start,
+                            out_start, chunk, args...)
+    end
+end
+
+function _conv_os_core_kern!(
+    out, os_thread_buff, filter_fd, u, sv, nffts, u_start, out_start,
+    input_block_region, save_blocksize, tdbuff_region, valid_buff_region
+)
+    @inbounds for block_pos in input_block_region
+        # Calculate portion of data to transform
+        block_idx = Tuple(block_pos)
         ## data_offset is NOT the beginning of the region that will be
         ## convolved, but is instead the beginning of the unaliased data.
         data_offset = save_blocksize .* (block_idx .- 1)
@@ -592,27 +699,20 @@ function unsafe_conv_kern_os!(out,
 
         # Convolve this portion of the data
 
-        copyto!(tdbuff, tdbuff_region, u, data_region)
-        os_conv_block!(tdbuff, fdbuff, filter_fd, p, ip)
+        copyto!(os_thread_buff.tdbuff, tdbuff_region, u, data_region)
+        os_conv_block!(os_thread_buff, filter_fd)
 
         # Save convolved result to output
 
         block_out_region = CartesianIndices(
             UnitRange.(data_offset .+ out_start, data_stop .+ out_start .- 1)
         )
-        copyto!(out, block_out_region, tdbuff, valid_buff_region)
+        copyto!(out, block_out_region, os_thread_buff.tdbuff, valid_buff_region)
     end
-
-    out
 end
 
-function _conv_kern_fft!(out,
-                         u::AbstractArray{T, N},
-                         v::AbstractArray{T, N},
-                         su,
-                         sv,
-                         outsize,
-                         nffts) where {T<:Real, N}
+function _conv_simple_fft!(out, u::AbstractArray{T, N}, v::AbstractArray{T, N},
+                         su, sv, outsize, nffts) where {T<:Real, N}
     padded = _zeropad(u, nffts)
     p = plan_rfft(padded)
     uf = p * padded
@@ -620,12 +720,11 @@ function _conv_kern_fft!(out,
     vf = p * padded
     uf .*= vf
     raw_out = irfft(uf, nffts[1])
-    copyto!(out,
-            CartesianIndices(out),
-            raw_out,
+    copyto!(out, CartesianIndices(out), raw_out,
             CartesianIndices(UnitRange.(1, outsize)))
 end
-function _conv_kern_fft!(out, u, v, su, sv, outsize, nffts)
+
+function _conv_simple_fft!(out, u, v, su, sv, outsize, nffts)
     upad = _zeropad(u, nffts)
     vpad = _zeropad(v, nffts)
     p! = plan_fft!(upad)
@@ -633,35 +732,470 @@ function _conv_kern_fft!(out, u, v, su, sv, outsize, nffts)
     p! * vpad
     upad .*= vpad
     ifft!(upad)
-    copyto!(out,
-            CartesianIndices(out),
-            upad,
+    copyto!(out, CartesianIndices(out), upad,
             CartesianIndices(UnitRange.(1, outsize)))
 end
 
 # v should be smaller than u for good performance
-function _conv_fft!(out, u, v, su, sv, outsize)
+function _conv_fft!(out, u, v, su, sv, outsize; nt = 1)
     os_nffts = map(optimalfftfiltlength, sv, su)
     if any(os_nffts .< outsize)
-        unsafe_conv_kern_os!(out, u, v, su, sv, outsize, os_nffts)
+        _conv_os!(out, u, v, su, sv, outsize, os_nffts, nt = nt)
     else
         nffts = nextfastfft(outsize)
-        _conv_kern_fft!(out, u, v, su, sv, outsize, nffts)
+        _conv_simple_fft!(out, u, v, su, sv, outsize, nffts)
     end
 end
 
+is_vec(sa::NTuple) = sum(x -> x > 1, sa) <= 1
+is_vec(a::AbstractArray) = is_vec(size(a))
 
-# For arrays with weird offsets
+function vec_dim(sa)
+    first_nonscalar = findfirst(x -> x > 1, sa)
+    keepdim::Int = first_nonscalar == nothing ? 1 : first_nonscalar
+    return keepdim
+end
+
+function squash_vec(a::AbstractArray{<:Any, N}, keepdim::Int) where N
+    dims_to_drop = ntuple(i -> i + (i >= keepdim), N - 1)
+    return dropdims(a, dims = dims_to_drop)
+end
+
+_conv_size(su::NTuple{N, Int}, sv::NTuple{N, Int}) where N = su .+ sv .- 1
+
+function _conv_size(su::NTuple{N, Int}, sv::NTuple{1, Int}, dim = 1) where N
+    ntuple(i -> i == dim ? su[i] + sv[i] - 1 : su[i], N)
+end
+
+function _conv_direct_separable_arrs!(out::AbstractArray{<:Any, N}, alt_out,
+                                      arrs_alt_out, u, vs, su, svs, out_axes,
+                                      input_range; kwargs...) where N
+    nv = length(vs)
+    nv == 0 && return input_range
+    curr_input_range = input_range
+    curr_si = su
+    outsize = axes_to_size(out_axes)
+    for i in 1:nv
+        if iseven(nv - i  + arrs_alt_out)
+            thisout = out
+            inbuff = alt_out
+        else
+            thisout = alt_out
+            inbuff = out
+        end
+        if i == 1
+            thisin = u
+        else
+            thisin = inbuff
+            curr_si = outsize
+        end
+        _conv_direct!(thisout, thisin, vs[i], curr_si, svs[i], outsize,
+                      curr_input_range; kwargs...)
+        filled_output = last.(curr_input_range) .+ svs[i] .- 1
+        curr_input_range = OneTo.(filled_output)
+    end
+    return curr_input_range
+end
+
+function tuple_shiftndx(tupin::NTuple{N}, shiftndx::NTuple{N, Int}) where N
+    ntuple(j -> tupin[shiftndx[j]], N)
+end
+
+axes_to_size(a) = last.(a) .- first.(a) .+ 1
+
+function _conv_direct_separable_vecs!(out::AbstractArray{<:Any, N},
+                                      alternate_out, u, vs, vs_dims, su,
+                                      out_axes, input_range; kwargs...) where N
+    nv = length(vs)
+    nv == 0 && return out
+    curr_input_range = input_range
+    curr_dims = ntuple(identity, N)
+    curr_outsize = axes_to_size(out_axes)
+    curr_out = out
+    curr_alt_out = alternate_out
+    curr_input_range = input_range
+    curr_si = su
+    shifts = Vector{Int}(undef, N)
+    for i in 1:nv
+        vdim = vs_dims[i]
+        v = vs[i]
+        sv = size(v)
+        if i == 1
+            thisin = u
+        else
+            thisin = curr_alt_out
+            curr_si = curr_outsize
+        end
+        if curr_dims[1] != vdim
+            # permute array so its first dimension is the same as the vector's
+
+            dim_pos::Int = findfirst(isequal(vdim), curr_dims)
+
+            # calculating the shifts in the array before turning it into an
+            # ntuple allows the compiler to infer the ntuple's type
+            for j in 1:N
+                @inbounds shifts[j] = mod(j + dim_pos - 2, N) + 1
+            end
+            shift_ndxs = ntuple(j -> @inbounds(shifts[j]), N)
+
+            curr_dims = tuple_shiftndx(curr_dims, shift_ndxs)
+            curr_outsize = tuple_shiftndx(curr_outsize, shift_ndxs)
+            curr_si = curr_outsize
+            perm_input_r = tuple_shiftndx(curr_input_range, shift_ndxs)
+            curr_out = reshape(out, curr_outsize)
+            permutedims!(curr_out, thisin, shift_ndxs)
+            curr_alt_out = reshape(alternate_out, curr_outsize)
+            curr_input_range = perm_input_r
+            thisin = curr_out
+        end
+        _conv_direct!(curr_alt_out, thisin, v, curr_si, sv, curr_outsize,
+                      curr_input_range; kwargs...)
+        filled_output = _conv_size(last.(curr_input_range), sv)
+        curr_input_range = OneTo.(filled_output)
+    end
+    if curr_dims != ntuple(identity, N)
+        sp = sortperm(collect(curr_dims))
+        shift_ndxs = ntuple(i -> sp[i], N)
+        permutedims!(out, curr_alt_out, shift_ndxs)
+    end
+    return out
+end
+
+function default_vec_mask(svs, vec_mask)
+    if vec_mask == nothing
+        v_vec_mask = map(is_vec, svs)
+    else
+        if length(vec_mask) != length(svs)
+            throw(ArgumentError("vec_mask must be `nothing` or the same length as `vs`"))
+        end
+        v_vec_mask = convert(BitVector, vec_mask)
+    end
+    v_vec_mask
+end
+
+# This does not work with offset arrays
+function _conv_direct_separable!(out::AbstractArray, alt_out, u,
+                                 vs::AbstractVector{<:AbstractArray}, su,
+                                 out_axes::NormalAxes,
+                                 input_range::NormalAxes = axes(u),
+                                 vec_mask::Union{Nothing, AbstractVector{Bool}} = nothing;
+                                 nt = 1,
+                                 use_small = nothing)
+    svs = size.(vs)
+    v_vec_mask = default_vec_mask(svs, vec_mask)
+    if any(v_vec_mask)
+        v_vec_ndxs = findall(v_vec_mask)
+        vvs_dims = map(vec_dim, svs[v_vec_ndxs])
+        sp = sortperm(vvs_dims)
+        vvs_dims .= vvs_dims[sp]
+
+        arrs_alt_out = vvs_dims[1] != 1
+        v_arr_ndxs = findall(.!v_vec_mask)
+        curr_input_r = _conv_direct_separable_arrs!(out, alt_out, arrs_alt_out,
+                                                    u, vs[v_arr_ndxs], su,
+                                                    svs[v_arr_ndxs], out_axes,
+                                                    input_range; nt = nt)
+
+        vvs = squash_vec.(vs[v_vec_ndxs][sp], vvs_dims)
+        _conv_direct_separable_vecs!(out, alt_out, u, vvs, vvs_dims, su, out_axes,
+                                     curr_input_r; nt = nt, use_small = use_small)
+    else
+        arrs_alt_out = false
+        curr_input_r = _conv_direct_separable_arrs!(out, alt_out, arrs_alt_out,
+                                                    u, vs, su, svs, out_axes,
+                                                    input_range; nt = nt)
+    end
+    return out
+end
+
+_out_offset(vr::OneTo{T}) where T = zero(T)
+_out_offset(vr) = first(va)
+
+function _conv_direct!(out::AbstractVector, u::AbstractVector, v::AbstractVector,
+                       su, sv, outsize, input_range = 1:size(u, 1); nt = 1,
+                       use_small = nothing)
+    nv = sv[1]
+    silen = nv - 1
+    si = zeros(promote_type(eltype(u), eltype(v), eltype(out)), silen)
+    if use_small === nothing
+        use_small = nv <= SMALL_FILT_CUTOFF
+    end
+    if nt == 1
+        if use_small
+            _small_filt_fir!(out, v, u, si, 1, input_range)
+        else
+            _filt_fir!(out, v, u, si, 1, silen, input_range)
+        end
+    else
+        ua = axes(u)
+        chunks = splits(input_range, nt)
+        nchunk = sum(!isempty, chunks)
+        ntask = nchunk - 1
+        tasks = Vector{Task}(undef, ntask)
+        n_systhr = Threads.nthreads()
+        sibuffs = Vector{typeof(si)}(undef, n_systhr  + 1)
+        for i in 1:n_systhr
+            sibuffs[i] = similar(si)
+        end
+        sibuffs[end] = si
+        si_init = copy(si)
+        for tno in 1:ntask
+            tasks[tno] = @spawn _filt_fir_row_thread_exec!(
+                out, v, u, si_init, sibuffs, 1, silen, chunks[tno], ua, use_small
+            )
+        end
+        # Need the filter state, si, to be "correct" for the end of the signal
+        _filt_fir_row_thread_exec!(
+            out, v, u, si_init, sibuffs, 1, silen, chunks[nchunk], ua, use_small,
+            n_systhr + 1
+        )
+        foreach(wait, tasks)
+    end
+    unsafe_copyto!(out, su[1] + 1, si, 1, silen)
+end
+
+function _conv_direct_cols_kern!(out, si, u, v, input_range, use_small,
+                                 col_range, col_li, out_li, ur, silen)
+    if use_small
+        @inbounds for R in col_range
+            colno = col_li[R]
+            fill!(si, 0)
+            _small_filt_fir!(out, v, u, si, colno, ur)
+            outpos = out_li[last(input_range[1]) + 1, R]
+            unsafe_copyto!(out, outpos, si, 1, silen)
+        end
+    else
+        @inbounds for R in col_range
+            fill!(si, 0)
+            _filt_fir!(out, v, u, si, R, silen, ur)
+            outpos = out_li[last(input_range[1]) + 1, R]
+            unsafe_copyto!(out, outpos, si, 1, silen)
+        end
+    end
+end
+
+function _conv_direct_cols_texec!(out, sibuffs, u, v, input_range, use_small,
+                                  col_ranges, col_li, out_li, ur, silen)
+    si = sibuffs[Threads.threadid()]
+    for col_range in col_ranges
+        _conv_direct_cols_kern!(out, si, u, v, input_range, use_small, col_range,
+                                col_li, out_li, ur, silen)
+    end
+end
+
+function _conv_direct!(out::AbstractArray, u::AbstractArray, v::AbstractVector,
+                       su, sv, outsize, input_range = axes(u); nt = 1,
+                       use_small = nothing)
+    nv = sv[1]
+    silen = nv - 1
+    if use_small === nothing
+        use_small = nv <= SMALL_FILT_CUTOFF
+    end
+
+    sitype = promote_type(eltype(u), eltype(v), eltype(out))
+    out_li = LinearIndices(out)
+    col_li = LinearIndices(tail(su))
+    input_region = CartesianIndices(input_range)
+    col_range = safetail(input_region)
+    row_range = safehead(input_region)
+    if nt == 1
+        si = Vector{sitype}(undef, silen)
+        _conv_direct_cols_kern!(out, si, u, v, input_range, use_small, col_range,
+                                col_li, out_li, row_range, silen)
+    else
+        rsi = RegionSplitIter(col_range, nt)
+        nchunk = length(rsi)
+        tasks = Vector{Task}(undef, nchunk - 1)
+        nsysthr = Threads.nthreads()
+        sibuffs = Vector{Vector{sitype}}(undef, nsysthr)
+        for i in 1:nsysthr
+            @inbounds sibuffs[i] = Vector{sitype}(undef, silen)
+        end
+        @inbounds for (i, chunks) in enumerate(rsi)
+            if i < nchunk
+                tasks[i] = @spawn(
+                    _conv_direct_cols_texec!(out, sibuffs, u, v, input_range,
+                                             use_small, chunks, col_li, out_li,
+                                             row_range, silen)
+                )
+            else
+                _conv_direct_cols_texec!(out, sibuffs, u, v, input_range,
+                                         use_small, chunks, col_li, out_li,
+                                         row_range, silen)
+            end
+        end
+        foreach(wait, tasks)
+    end
+    out
+end
+
+_conv_center_range(ua::NormalAxes, va::NormalAxes) = UnitRange.(
+    last.(va), last.(ua) .- first.(va) .+ 1
+)
+_conv_center_range(ua, va) = UnitRange.(
+    first.(ua) .+ last.(va), last.(ua) .+ first.(va)
+)
+
+_conv_v_offset(va::NormalAxes) = CartesianIndex(last.(va))
+_conv_v_offset(va) = CartesianIndex(first.(va) .+ last.(va))
+
+_conv_edge_b_offset(ua, va) = CartesianIndex(first.(ua)) + CartesianIndex(last.(va))
+
+_conv_edge_b_offset(ua::NormalAxes, va::NormalAxes) =
+    CartesianIndex(last.(va))
+
+_conv_edge_e_offset(ua, va) = CartesianIndex(last.(ua)) + CartesianIndex(first.(va))
+
+_conv_edge_e_offset(ua::NormalAxes, va::NormalAxes) =
+    CartesianIndex(last.(ua))
+
+split_index_to_tuple((x, X)) = (x, Tuple(X))
+
+start_ndx(ax) = CartesianIndex(first.(ax))
+stop_ndx(ax) = CartesianIndex(last.(ax))
+
+function _conv_direct_dim_edge_range(output_range::UnitRange{Int},
+                                     center_range::UnitRange{Int})
+    cstart, cstop = first(center_range), last(center_range)
+    ostart, ostop = first(output_range), last(output_range)
+    cstop >= cstart ? [ostart : cstart - 1, cstop + 1 : ostop] : [output_range]
+end
+
+_conv_direct_dim_edge_range(a::OneTo{Int}, b) where N =
+    _conv_direct_dim_edge_range(convert(UnitRange{Int}, a), b)
+
+_conv_direct_dim_edge_range(a, b::OneTo{Int}) =
+    _conv_direct_dim_edge_range(a, convert(UnitRange{Int}, b))
+
+function _conv_direct!(out::AbstractArray{T, N}, u::AbstractArray{<:Any, N},
+                       v::AbstractArray{<:Any, N}, su, sv, outsize,
+                       input_range = axes(u), output_range = axes(out); nt = 1,
+                       use_small = nothing) where {T, N}
+    va = axes(v)
+    rv = dsp_reflect(v)
+    center_range = _conv_center_range(input_range, va)
+    perimeter_range = Vector{UnitRange{Int}}(undef, N)
+    all_dims = 1:N
+    edge_ranges = map(_conv_direct_dim_edge_range, output_range, center_range)
+    voffsets = safeheadtail(_conv_v_offset(va))
+    v_starts = safeheadtail(start_ndx(va))
+    v_stops = safeheadtail(stop_ndx(va))
+    edge_b_offsets = safeheadtail(_conv_edge_b_offset(input_range, va))
+    edge_e_offsets = safeheadtail(_conv_edge_e_offset(input_range, va))
+    for n_edges in all_dims
+        _conv_direct_edge!(out, perimeter_range, Val(n_edges), u, rv,
+                           voffsets, v_starts, v_stops,
+                           edge_b_offsets, edge_e_offsets, all_dims,
+                           center_range, edge_ranges)
+    end
+    _conv_direct_core!(out, u, rv, voffsets, center_range, nt = nt)
+    out
+end
+
+function _conv_direct_edge!(out::AbstractArray{T, N}, perimeter_range,
+                            n_edges::Val, u, rv, voffsets,
+                            v_starts, v_stops, edge_b_offsets, edge_e_offsets,
+                            all_dims, center_range, edge_ranges) where {T, N}
+    voffset, VOffset = voffsets
+    v_start, V_Start = v_starts
+    v_stop, V_Stop = v_stops
+    edge_b_offset, Edge_B_offset = edge_b_offsets
+    edge_e_offset, Edge_E_offset = edge_e_offsets
+    zeroidx = zero(Edge_B_offset)
+    for edge_dims in subsets(all_dims, n_edges)
+        copyto!(perimeter_range, 1, center_range, 1, N)
+        selected_edge_ranges = getindex.(Ref(edge_ranges), edge_dims)
+        for perimeter_edge_ranges in Iterators.ProductIterator(selected_edge_ranges)
+            @inbounds for (i, dim) in enumerate(edge_dims)
+                perimeter_range[dim] = perimeter_edge_ranges[i]
+            end
+            edge_region = CartesianIndices(
+                NTuple{N, UnitRange{Int}}(perimeter_range)
+            )
+            for out_R in safetail(edge_region)
+                overlap_R_lower = max(zeroidx, Edge_B_offset - out_R) + V_Start
+                overlap_R_upper = min(zeroidx, Edge_E_offset - out_R) + V_Stop
+                overlap_R = overlap_R_lower : overlap_R_upper
+                u_R_offset = out_R - VOffset
+                for out_i in safehead(edge_region)
+                    overlap_r_lower = max(0, edge_b_offset - out_i) + v_start
+                    overlap_r_upper = min(0, edge_e_offset - out_i) + v_stop
+                    overlap_r = overlap_r_lower : overlap_r_upper
+                    u_r_offset = out_i - voffset
+                    accum = zero(T)
+                    for accum_I in overlap_R
+                        @inbounds for accum_i in overlap_r
+                            accum = muladd(
+                                u[accum_i + u_r_offset, accum_I + u_R_offset],
+                                rv[accum_i, accum_I],
+                                accum
+                            )
+                        end
+                    end
+                    @inbounds out[out_i, out_R] = accum
+                end
+            end
+        end
+    end
+end
+
+function _conv_direct_core!(
+    out::AbstractArray, u, rv, voffsets, center_range; nt = 1
+) where N
+    center_region = CartesianIndices(center_range)
+    isempty(center_region) && return
+    voffset, VOffset = voffsets
+    v_region = CartesianIndices(axes(rv))
+    if nt == 1
+        _conv_direct_core_kern!(out, u, rv, voffset, VOffset, center_region, v_region)
+    else
+        rsi = RegionSplitIter(center_region, nt)
+        nchunk = length(rsi)
+        tasks = Vector{Task}(undef, nchunk - 1)
+        for (cno, chunk_regions) in enumerate(rsi)
+            if cno < nchunk
+                tasks[cno] = @spawn(
+                    _conv_direct_core_texec!(out, u, rv, voffset, VOffset, chunk_regions, v_region)
+                )
+            else
+                _conv_direct_core_texec!(out, u, rv, voffset, VOffset, chunk_regions, v_region)
+            end
+        end
+        foreach(wait, tasks)
+    end
+end
+
+function _conv_direct_core_texec!(out, u, rv, voffset, VOffset, center_regions,
+                                  v_region)
+    for center_region in center_regions
+        _conv_direct_core_kern!(out, u, rv, voffset, VOffset, center_region, v_region)
+    end
+end
+
+function _conv_direct_core_kern!(out::AbstractArray{T}, u, rv, voffset, VOffset,
+                                 center_region, v_region) where T
+    vr, VR = safeheadtail(v_region)
+    for OutPos in safetail(center_region)
+        UOffset = OutPos - VOffset
+        for outpos in safehead(center_region)
+            uoffset = outpos - voffset
+            accum = zero(T)
+            @inbounds for J in VR, j in vr
+                accum = muladd(u[uoffset+j, UOffset+J], rv[j,J], accum)
+            end
+            @inbounds out[outpos,OutPos] = accum
+        end
+    end
+end
+
 function _conv_similar(u, outsize, axesu, axesv)
     out_offsets = first.(axesu) .+ first.(axesv)
     out_axes = UnitRange.(out_offsets, out_offsets .+ outsize .- 1)
     similar(u, out_axes)
 end
-function _conv_similar(
-    u, outsize, ::NTuple{<:Any, Base.OneTo{Int}}, ::NTuple{<:Any, Base.OneTo{Int}}
-)
-    similar(u, outsize)
-end
+
+_conv_similar(u, outsize, ::NormalAxes, ::NormalAxes) = similar(u, outsize)
+
 _conv_similar(u, v, outsize) = _conv_similar(u, outsize, axes(u), axes(v))
 
 # Does convolution, will not switch argument order
@@ -768,8 +1302,11 @@ function check_padmode_kwarg(padmode::Symbol, su::Integer, sv::Integer)
     end
 end
 
-dsp_reverse(v, ::NTuple{<:Any, Base.OneTo{Int}}) = reverse(v, dims = 1)
-function dsp_reverse(v, vaxes)
+function dsp_reverse(v::AbstractVector, ::NormalAxes)
+    reverse(v, dims = 1)
+end
+
+function dsp_reverse(v::AbstractVector, vaxes)
     vsize = length(v)
     reflected_start = - first(vaxes[1]) - vsize + 1
     reflected_axes = (reflected_start : reflected_start + vsize - 1,)
@@ -777,6 +1314,17 @@ function dsp_reverse(v, vaxes)
     copyto!(out, reflected_start, Iterators.reverse(v), 1, vsize)
 end
 
+function dsp_reflect(v::AbstractArray) where N
+    out = similar(v)
+    v_region = CartesianIndices(v)
+    IFirst = first(v_region)
+    ILast = last(v_region)
+    sv = size(v)
+    @inbounds for offset in CartesianIndices(UnitRange.(0, sv .- 1))
+        out[offset + IFirst] = v[ILast - offset]
+    end
+    out
+end
 
 """
     xcorr(u,v; padmode = :longest)
@@ -814,3 +1362,133 @@ function xcorr(
         throw(ArgumentError("padmode keyword argument must be either :none or :longest"))
     end
 end
+
+
+struct RegionSplitIter{N}
+    full_region::CartesianIndices{N, NTuple{N, UnitRange{Int}}}
+    target_n_split::Int
+    splitdim::Int
+    trail_range::UnitRange{Int}
+
+    function RegionSplitIter{N}(full_region::CartesianIndices{N, NTuple{N, UnitRange{Int}}},
+                                target_n_split::Int, min_split_dim) where N
+        min_split_dim <= N || throw(ArgumentError("min_split_dim must be less than or equal to N"))
+        target_n_split < 0 && throw(ArgumentError("target_n_split must be non-negative"))
+        raw_splitdim = range_splitdim(size(full_region), target_n_split)
+        splitdim = max(min_split_dim, raw_splitdim)
+        ntrail = 1
+        for i in splitdim:N
+            ntrail *= size(full_region, i)
+        end
+        new(full_region, target_n_split, splitdim, 1:ntrail)
+    end
+end
+
+function RegionSplitIter(full_region::CartesianIndices{N, NTuple{N, UnitRange{Int}}},
+                         target_n_split, min_split_dim = 0) where N
+    RegionSplitIter{N}(full_region, target_n_split, min_split_dim)
+end
+
+function RegionSplitIter(full_region::CartesianIndices{N, NormalAxes{N}}, args...) where N
+    RegionSplitIter(
+        convert(CartesianIndices{N, NTuple{N, UnitRange{Int}}}, full_region),
+        args...
+    )
+end
+
+function iterate(iter::RegionSplitIter{N}, state = 1) where N
+    if state > iter.target_n_split || isempty(iter.full_region)
+        return nothing
+    end
+    r = split_range(state, iter.trail_range, iter.target_n_split)
+    isempty(r) && return
+    carts = range_to_cart_vec(iter.full_region, r, iter.splitdim)
+    return carts, state + 1
+end
+
+IteratorSize(::Type{RegionSplitIter}) = HasLength()
+IteratorEltype(::Type{RegionSplitIter}) = HasEltype()
+eltype(iter::RegionSplitIter{N}) where N = Vector{CartesianIndices{N, NTuple{N, UnitRange{Int}}}}
+
+function length(iter::RegionSplitIter{N}) where N
+    len, rem = divrem(length(iter.trail_range), iter.target_n_split)
+    thislen = len == 0 ? rem : iter.target_n_split
+    return thislen
+end
+
+function range_splitdim(sz::NTuple{N, Int}, nsplit::Int) where N
+    i = N
+    p = 1
+    while i > 0 && p < nsplit
+        p *= sz[i]
+        i -= 1
+    end
+    return i + 1
+end
+
+range_splitdim(::Tuple{}, ::Int) = 0
+
+function range_to_cart_vec(c::C, r, splitdim) where C <: CartesianIndices
+    sz = size(c)
+    sd_sz = sz[splitdim]
+    range_step = 1
+    for i in 1 : splitdim - 1
+        @inbounds range_step *= sz[i]
+    end
+    off = mod(first(r) - 1, sd_sz)
+    ncart = cld(length(r) + off, sd_sz)
+    carts = Vector{C}(undef, ncart)
+    cart_nel = sd_sz - off
+    ib = first(r)
+    for i in 1:ncart
+        ie = min(ib + cart_nel - 1, last(r))
+        newcart = c[range_step * (ib - 1) + 1] : c[range_step * ie]
+        @inbounds carts[i] = newcart
+        ib = ie + 1
+        cart_nel = sd_sz
+    end
+    return carts
+end
+
+function split_range(splitno, r, nsplit)
+    nel = length(r)
+    len, rem = divrem(nel, nsplit)
+    if len == 0
+        if splitno > rem
+            rem = 0
+        else
+            len, rem = 1, 0
+        end
+    end
+    f = first(r) + ((splitno-1) * len)
+    l = f + len - 1
+    if rem > 0
+        if splitno <= rem
+            f = f + (splitno - 1)
+            l = l + splitno
+        else
+            f = f + rem
+            l = l + rem
+        end
+    end
+    return f:l
+end
+
+splits(r, nsplit) = map(x -> split_range(x, r, nsplit), 1:nsplit)
+
+## Taken from ImageFiltering.jl
+## Faster Cartesian iteration
+# Splitting out the first dimension saves a branch
+safetail(R::CartesianIndices) = CartesianIndices(tail(R.indices))
+safetail(R::CartesianIndices{1}) = CartesianIndices(())
+safetail(R::CartesianIndices{0}) = CartesianIndices(())
+safetail(I::CartesianIndex) = CartesianIndex(tail(Tuple(I)))
+safetail(::CartesianIndex{1}) = CartesianIndex(())
+safetail(::CartesianIndex{0}) = CartesianIndex(())
+
+safehead(R::CartesianIndices) = R.indices[1]
+safehead(R::CartesianIndices{0}) = CartesianIndices(())
+safehead(I::CartesianIndex) = I[1]
+safehead(::CartesianIndex{0}) = CartesianIndex(())
+
+safeheadtail(r) = (safehead(r), safetail(r))

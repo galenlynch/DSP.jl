@@ -1,8 +1,11 @@
 module DSP
 
 using FFTW
+using FFTW: unsafe_execute!
 using LinearAlgebra: mul!, rmul!
 using IterTools: subsets
+
+import Base: iterate, IteratorSize, IteratorEltype, length, eltype
 
 export conv, conv2, deconv, filt, filt!, xcorr
 
