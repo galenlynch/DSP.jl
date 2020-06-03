@@ -9,7 +9,7 @@ using DSP, Test
 #  dlmwrite('freqz-eg1.txt',[w, abs(h)], 'delimiter', '\t', 'precision', '%.12f')
 #
 #######################################
-@testset "freqz fro TF" begin
+@testset "freqz from TF" begin
     # Matlab
     freqz_eg1_w_abs = readdlm(joinpath(dirname(@__FILE__), "data", "freqz-eg1.txt"),'\t')
     matlab_w     = freqz_eg1_w_abs[:,1]

@@ -4,6 +4,7 @@ using Test, DSP, OffsetArrays
 import DSP: filt, filt!, deconv, conv, xcorr
 using DSP: optimalfftfiltlength, unsafe_conv_kern_os!, _conv_kern_fft!, _conv_similar,
     nextfastfft
+using DSP: split_range, range_to_cart_vec, range_splitdim, RegionSplitIter
 
 
 
@@ -276,4 +277,45 @@ end
         @test a == aa
         @test b == bb
     end
+end
+
+@testset "RegionSplitIter" begin
+    c = CartesianIndices((1:20, 1:5, 1:3, 1:1))
+    sz = size(c)
+    @test range_splitdim(sz, 4) == 2
+    splitdim = 2
+    carts = range_to_cart_vec(c, 5:11, splitdim)
+    @test length(carts) == 3
+    @test carts[1].indices == (1:20, 5:5, 1:1, 1:1)
+    @test carts[2].indices == (1:20, 1:5, 2:2, 1:1)
+    @test carts[3].indices == (1:20, 1:1, 3:3, 1:1)
+
+    rsi = RegionSplitIter(c, 4)
+    @test length(rsi) == 4
+    obs_len = 0
+    for _ in rsi
+        global obs_len += 1
+    end
+    @test obs_len == length(rsi)
+    @test rsi.splitdim == 2
+    @test eltype(rsi) == typeof(first(rsi))
+
+    testarr = BitArray(undef, sz)
+    fill!(testarr, false)
+    for regions in rsi
+        for region in regions
+            testarr[region] .= true
+        end
+    end
+    @test all(testarr)
+
+    rsi2 = RegionSplitIter(c, 4, 3)
+    @test rsi2.splitdim == 3
+    @test_throws ArgumentError RegionSplitIter(c, 4, 5)
+
+    @test_throws ArgumentError RegionSplitIter(c, -1)
+
+    cu = CartesianIndices(Matrix{Float64}(undef, (3, 3)))
+    rsiu = RegionSplitIter(cu, 4)
+    @test eltype(rsiu) == Vector{CartesianIndices{2, NTuple{2, UnitRange{Int}}}}
 end
