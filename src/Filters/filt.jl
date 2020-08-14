@@ -205,7 +205,7 @@ filt(f::DF2TFilter{T,S}, x::AbstractVector) where {T,S<:Array} =
     filt!(Vector{eltype(S)}(undef, length(x)), f, x)
 
 # Fall back to SecondOrderSections
-DF2TFilter(coef::FilterCoefficients) = DF2TFilter(convert(SecondOrderSections, coef))
+DF2TFilter(coef::FilterCoefficients, args...) = DF2TFilter(convert(SecondOrderSections, coef), args...)
 
 #
 # filtfilt
