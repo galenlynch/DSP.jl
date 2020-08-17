@@ -62,7 +62,7 @@ function filt!(out::AbstractArray, b::Union{AbstractVector, Number}, a::Union{Ab
     bs<sz   && (b = copyto!(zeros(eltype(b), sz), b))
     1<as<sz && (a = copyto!(zeros(eltype(a), sz), a))
 
-    initial_si = si
+    initial_si = copy(si)
     for col = 1:ncols
         # Reset the filter state
         si = initial_si[:, N > 1 ? col : 1]

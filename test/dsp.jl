@@ -32,6 +32,10 @@ using DSP: optimalfftfiltlength, unsafe_conv_kern_os!, _conv_kern_fft!, _conv_si
     @test filt(b, a, ones(10), si) ≈ ones(10) # Shouldn't affect DC offset
 
     @test_throws ArgumentError filt!([1, 2], [1], [1], [1])
+
+    # Make sure initial filter state is properly reset for each column of an array
+    b = 1:60
+    x = ones(100, 2)
 end
 
 @testset "conv" begin
