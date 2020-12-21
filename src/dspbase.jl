@@ -1492,3 +1492,42 @@ safehead(I::CartesianIndex) = I[1]
 safehead(::CartesianIndex{0}) = CartesianIndex(())
 
 safeheadtail(r) = (safehead(r), safetail(r))
+
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_direct!)}, nthreads::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    x = log(prod(su) * prod(sv))
+    piecewise = x < 11 ? 8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3 :
+        -0.68556 + 1.04102 * x
+    est = exp(piecewise)
+end
+
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_os!)}, nthreads::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    nffts = optimalfftfiltlength.(sv, su)
+    save_sizes = nffts .- sv .+ 1
+    nblocks = cld.(su, save_sizes)
+    nfft_prod = prod(nffts)
+    total_nblocks = prod(nblocks)
+    pred = total_nblocks * nfft_prod * log2(nfft_prod)
+    x = log(pred)
+    if pred < 3800 || total_nblocks > 1
+        piecewise = x <= 12 ?
+            7.038 + 1.584 * x - 0.2243 * x^2 + 0.01056 * x ^ 3 :
+            0.6545 + 0.94031 * x
+    else
+        piecewise = x <= 12 ?
+            68.02 -16.864 * x + 1.655 * x^2 - 0.05257 * x^3 :
+            1.816 + 0.9557 * x
+    end
+    est = exp(piecewise)
+end
