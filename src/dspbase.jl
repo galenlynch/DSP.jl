@@ -1498,35 +1498,43 @@ safehead(::CartesianIndex{0}) = CartesianIndex(())
 safeheadtail(r) = (safehead(r), safetail(r))
 
 function _conv_alg_estimate_runtime(
-    ::Type{typeof(_conv_direct!)}, nthreads::Integer,
+    ::Type{typeof(_conv_direct!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
     arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
 ) where {T, N, S, M}
     _, su = arr_a_info
     _, sv = arr_b_info
     x = log(prod(su) * prod(sv))
-    if nthreads == 1
-        piecewise = x < 11 ?
-            8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3 :
-            -0.68556 + 1.04102 * x
+    if nt == 1
+        if x < 7.5
+            piecewise = 8.157646933454654 + 0.07844244759200057*x
+        elseif x < 11
+            piecewise = 8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3
+        else
+            piecewise = -0.68556 + 1.04102 * x
+        end
     else
         center_size = ntuple(i -> sv[i] == 0 ? su[i] :
                              max(su[i] - sv[i] + 1, 0), N)
         using_single_t = all(center_size .== 1)
-        if using_single_t || x > 17
-            single_t_time = conv_alg_estimate_runtime(_conv_direct!, 1,
+        if using_single_t
+            return conv_alg_estimate_runtime(_conv_direct!, 1,
                                                       arr_a_info, arr_b_info)
-            using_single_t && return single_t_time
-            # Scale single t time
+        elseif x < 7.5
+            piecewise = 8.550990819203559 + 0.0785796095401578*x
+        elseif x < 15
+            piecewise = 9.457701766091818 + 0.07967585796608821*x -
+                0.07014518806614922*x^2 + 0.008745924358757803*x^3 -
+                0.00021177689617113388*x^4
         else
-            piecewise = 4.044 + 2.4908*x - 0.41892*x^2 + 0.028987*x^3 - 0.000606*x^4
+            piecewise = -0.68556 + 1.04102 * x - log(nt)
         end
     end
     est = exp(piecewise)
 end
 
 function _conv_alg_estimate_runtime(
-    ::Type{typeof(_conv_os!)}, nthreads::Integer,
+    ::Type{typeof(_conv_os!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
     arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
 ) where {T, N, S, M}
@@ -1539,19 +1547,18 @@ function _conv_alg_estimate_runtime(
     nfft_prod = prod(nffts)
     pred = nblocks * nfft_prod * log2(nfft_prod)
     x = log(pred)
-    if x < 9.5
-        piecewise = 10.23694074629848 + 0.06445546080160833*x
-    elseif x < 13
-        piecewise = 88.97279697607325 - 30.832984478857057*x +
-            4.579218942191232*x^2 - 0.3002845288164446*x^3 +
-            0.0073692177851378635*x^4
+    if x < 9
+        piecewise = 10.242898638073589 + 0.0631427671700507*x
+    elseif x < 13.9
+        piecewise =
+            -5.133560252102133 + 6.808505721368382*x - 1.057425292427571*x^2 +
+            0.06895927365694479*x^3 - 0.0015190211000349566*x^4
     else
-        piecewise = -0.4509641362031153 + 1.0165204102745422*x
-        # TODO: improve accuracy with large input, currently over-estimates by a factor of 2
+        piecewise = 0.3601223329213809 + 0.9593433925249776*x
     end
     if nt > 1 && x > 10.6
         if x > 15.5
-            piecewise -= 1.177
+            piecewise -= log(nt)
         else
             piecewise -= 0.18
         end
@@ -1560,7 +1567,7 @@ function _conv_alg_estimate_runtime(
 end
 
 function _conv_alg_estimate_runtime(
-    ::Type{typeof(_conv_simple_fft!)}, nthreads::Integer,
+    ::Type{typeof(_conv_simple_fft!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
     arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
 ) where {T, N, S, M}
@@ -1572,7 +1579,7 @@ function _conv_alg_estimate_runtime(
     pred = nel * log2(nel)
     x = log(pred)
     if x < 7.85
-        piecewise = 9.048406 + 0.677789*x - 0.10554*x^2 + 0.00585*x^3
+        piecewise = 10.209282616787162 + 0.06168190544766159*x
     elseif x <= 11.82
         piecewise = 16.0928 - 1.26684*x + 0.103726*x^2 - 0.00185*x^3
     else
