@@ -6,7 +6,8 @@ using DSP: _conv_os!, _conv_simple_fft!, _conv_direct!, _conv_direct_separable!,
 using DSP: _conv_direct!, _conv_direct_edge!, _conv_direct_core!, safeheadtail,
     safehead, safetail, _conv_center_range, dsp_reflect,
     _conv_direct_dim_edge_range, _conv_edge_b_offset, _conv_edge_e_offset,
-    _conv_v_offset, stop_ndx, start_ndx
+    _conv_v_offset, stop_ndx, start_ndx, ConvOSThreadBuffers, _zeropad!,
+    os_filter_transform!, _conv_os_core_kern_texec!
 
 const BENCH_SECONDS = 2.5
 const BENCH_MAX_NTRIALS = 10000
@@ -226,7 +227,8 @@ function run_all_benches!(io, df, nds, nus, nvs, elts, nts; resume_pos = nothing
                         )
                         println("Bench-marking array-vector convolutions for:")
                         @show nu, nv, elt, nd
-                        bench_vector!(io, df, out, alt_out, u, v, vbases, elt, nts)
+                        bench_vector!(io, df, out, alt_out, u, v, vbases, elt,
+                                      nts)
                     end
                     if alloc_size(nu, nv, nd, elt, false) <= MAX_B_SIZE
                         println("Bench-marking array convolutions for:")
@@ -234,7 +236,8 @@ function run_all_benches!(io, df, nds, nus, nvs, elts, nts; resume_pos = nothing
                         out, alt_out, u, v, vbases = allocate_test_arrays(
                             nu, nv, nd, false, elt
                         )
-                        run_array_benches!(io, df, out, alt_out, u, v, vbases, elt, nts)
+                        run_array_benches!(io, df, out, alt_out, u, v, vbases,
+                                           elt, nts)
                     end
                 end
             end
@@ -245,9 +248,10 @@ end
 
 df = DataFrame(elt = DataType[], su = NTuple{<:Any, Int}[],
                sv = NTuple{<:Any, Int}[], nt = Int[], conv_method = Symbol[],
-               times = Vector{Float64}[], mem = Int[])
+               ntrials = Vector{Int}(), median_t = Vector{Float64}(),
+               t_std = Vector{Float64}(), mem = Int[])
 
-fname = "/home/glynch/bench_fast.csv"
+fname = "/home/glynch/Downloads/bench_fast.csv"
 dfraw = DataFrame(CSV.File(fname))
 df_td = Dict("Float64" => Float64, "Int64" => Int)
 to_ntuple = x -> eval(Meta.parse(x))

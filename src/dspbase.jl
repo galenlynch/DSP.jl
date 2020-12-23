@@ -33,8 +33,9 @@ end
 Same as [`filt`](@ref) but writes the result into the `out` argument, which may
 alias the input `x` to modify it in-place.
 """
-function filt!(out::AbstractArray, b::Union{AbstractVector, Number}, a::Union{AbstractVector, Number},
-               x::AbstractArray{T}, si::AbstractArray{S,N} = _zerosi(b,a,T)) where {T,S,N}
+function filt!(out::AbstractArray, b::Union{AbstractVector, Number},
+               a::Union{AbstractVector, Number}, x::AbstractArray{T},
+               si::AbstractArray{S,N} = _zerosi(b,a,T)) where {T,S,N}
     isempty(b) && throw(ArgumentError("filter vector b must be non-empty"))
     isempty(a) && throw(ArgumentError("filter vector a must be non-empty"))
     a[1] == 0  && throw(ArgumentError("filter vector a[1] must be nonzero"))
@@ -1147,7 +1148,8 @@ function _conv_direct_core!(
     voffset, VOffset = voffsets
     v_region = CartesianIndices(axes(rv))
     if nt == 1
-        _conv_direct_core_kern!(out, u, rv, voffset, VOffset, center_region, v_region)
+        _conv_direct_core_kern!(out, u, rv, voffset, VOffset, center_region,
+                                v_region)
     else
         rsi = RegionSplitIter(center_region, nt)
         nchunk = length(rsi)
@@ -1155,10 +1157,12 @@ function _conv_direct_core!(
         for (cno, chunk_regions) in enumerate(rsi)
             if cno < nchunk
                 tasks[cno] = @spawn(
-                    _conv_direct_core_texec!(out, u, rv, voffset, VOffset, chunk_regions, v_region)
+                    _conv_direct_core_texec!(out, u, rv, voffset, VOffset,
+                                             chunk_regions, v_region)
                 )
             else
-                _conv_direct_core_texec!(out, u, rv, voffset, VOffset, chunk_regions, v_region)
+                _conv_direct_core_texec!(out, u, rv, voffset, VOffset,
+                                         chunk_regions, v_region)
             end
         end
         foreach(wait, tasks)
@@ -1501,8 +1505,23 @@ function _conv_alg_estimate_runtime(
     _, su = arr_a_info
     _, sv = arr_b_info
     x = log(prod(su) * prod(sv))
-    piecewise = x < 11 ? 8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3 :
-        -0.68556 + 1.04102 * x
+    if nthreads == 1
+        piecewise = x < 11 ?
+            8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3 :
+            -0.68556 + 1.04102 * x
+    else
+        center_size = ntuple(i -> sv[i] == 0 ? su[i] :
+                             max(su[i] - sv[i] + 1, 0), N)
+        using_single_t = all(center_size .== 1)
+        if using_single_t || x > 17
+            single_t_time = conv_alg_estimate_runtime(_conv_direct!, 1,
+                                                      arr_a_info, arr_b_info)
+            using_single_t && return single_t_time
+            # Scale single t time
+        else
+            piecewise = 4.044 + 2.4908*x - 0.41892*x^2 + 0.028987*x^3 - 0.000606*x^4
+        end
+    end
     est = exp(piecewise)
 end
 
@@ -1514,20 +1533,51 @@ function _conv_alg_estimate_runtime(
     _, su = arr_a_info
     _, sv = arr_b_info
     nffts = optimalfftfiltlength.(sv, su)
-    save_sizes = nffts .- sv .+ 1
-    nblocks = cld.(su, save_sizes)
+    save_blocksize = nffts .- sv .+ 1
+    outsize = su .+ sv .- 1
+    nblocks = prod(cld.(outsize, save_blocksize))
     nfft_prod = prod(nffts)
-    total_nblocks = prod(nblocks)
-    pred = total_nblocks * nfft_prod * log2(nfft_prod)
+    pred = nblocks * nfft_prod * log2(nfft_prod)
     x = log(pred)
-    if pred < 3800 || total_nblocks > 1
-        piecewise = x <= 12 ?
-            7.038 + 1.584 * x - 0.2243 * x^2 + 0.01056 * x ^ 3 :
-            0.6545 + 0.94031 * x
+    if x < 9.5
+        piecewise = 10.23694074629848 + 0.06445546080160833*x
+    elseif x < 13
+        piecewise = 88.97279697607325 - 30.832984478857057*x +
+            4.579218942191232*x^2 - 0.3002845288164446*x^3 +
+            0.0073692177851378635*x^4
     else
-        piecewise = x <= 12 ?
-            68.02 -16.864 * x + 1.655 * x^2 - 0.05257 * x^3 :
-            1.816 + 0.9557 * x
+        piecewise = -0.4509641362031153 + 1.0165204102745422*x
+        # TODO: improve accuracy with large input, currently over-estimates by a factor of 2
+    end
+    if nt > 1 && x > 10.6
+        if x > 15.5
+            piecewise -= 1.177
+        else
+            piecewise -= 0.18
+        end
     end
     est = exp(piecewise)
 end
+
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_simple_fft!)}, nthreads::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    sout = su .+ sv .- 1
+    nffts = nextfastfft.(sout)
+    nel = prod(nffts)
+    pred = nel * log2(nel)
+    x = log(pred)
+    if x < 7.85
+        piecewise = 9.048406 + 0.677789*x - 0.10554*x^2 + 0.00585*x^3
+    elseif x <= 11.82
+        piecewise = 16.0928 - 1.26684*x + 0.103726*x^2 - 0.00185*x^3
+    else
+        piecewise = 2.030967 + 0.89380 * x
+    end
+    est = exp(piecewise)
+end
+
