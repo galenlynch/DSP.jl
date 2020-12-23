@@ -1533,6 +1533,61 @@ function _conv_alg_estimate_runtime(
     est = exp(piecewise)
 end
 
+# TODO: Fix estimation interface for separable arrays
+
+function _conv_separable_vecs! end # wrapper for this
+
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_separable_vecs!)}, nt::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    x = log(prod(su) * sum(sv))
+    if x < 6.9
+        piecewise = 6.628205506599878 + 0.20478048024564485*x
+    elseif x < 10.3
+        piecewise = 11.300227136465342 - 1.2402974913689009*x +
+            0.12432588572995124*x^2 - 0.001825256238931861*x^3
+    else
+        piecewise = 1.4272886571731935 + 0.8053069087421076*x
+    end
+    est = exp(piecewise)
+end
+
+function _conv_separable_arrs! end
+
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_separable_arrs!)}, nt::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    x = log(prod(su) * sum(sv))
+    if nt == 1
+        if x < 6.65
+            piecewise = 8.887908453439723 + 0.07853391894975105*x
+        elseif x < 12
+            piecewise = 13.049750432269299 - 1.2199537371993463*x +
+                0.10799374530648398*x^2 - 0.0010384971965576118*x^3
+        else
+            piecewise = 0.3340886884136683 + 0.9833063997593783*x
+        end
+    else
+        if x < 8.3
+            piecewise = 9.467030428280037 + 0.056982245763379985*x
+        elseif x < 14.6
+            piecewise = 10.468589924722554 - 0.09271057879997203*x -
+                0.018195314945829932*x^2 + 0.0027491198584483575*x^3
+        else
+            piecewise = 0.6040886884136683 + 0.9833063997593783*x - log(nt)
+        end
+    end
+    est = exp(piecewise)
+end
+
 function _conv_alg_estimate_runtime(
     ::Type{typeof(_conv_os!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
