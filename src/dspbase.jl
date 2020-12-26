@@ -1587,7 +1587,6 @@ function _conv_alg_estimate_runtime(
     end
     est = exp(piecewise)
 end
-
 function _conv_alg_estimate_runtime(
     ::Type{typeof(_conv_os!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
@@ -1643,3 +1642,56 @@ function _conv_alg_estimate_runtime(
     est = exp(piecewise)
 end
 
+
+function _conv_direct_small! end
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_direct_small!)}, nt::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    x = log(prod(su) * sum(sv))
+    if x < 3.2
+        piecewise = 3.8350440097252827 + 0.09207407962416803*x
+    elseif x < 7.5
+        piecewise = 3.9801175054732942 - 0.1083897233674473*x +
+            0.062238253279432415*x^2 - 2.9055628603501725e-5*x^3
+    else
+        piecewise = -0.5667804673384191 + 0.954962473944651*x
+    end
+    est = exp(piecewise)
+end
+
+function _conv_direct_not_small! end
+function _conv_alg_estimate_runtime(
+    ::Type{typeof(_conv_direct_not_small!)}, nt::Integer,
+    arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
+    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+) where {T, N, S, M}
+    _, su = arr_a_info
+    _, sv = arr_b_info
+    x = log(prod(su) * sum(sv))
+    if x < 3.2
+        piecewise = 3.8350440097252827 + 0.09207407962416803*x
+    elseif x < 7.5
+    else
+        piecewise = -0.2623613932525886 + 0.943819387724145*x
+    end
+    est = exp(piecewise)
+end
+
+function _estimate_alloc_time(n)
+    x = log(n)
+    if x < 3.76
+        est = 3.5743543446375496 + 0.06464704465781758*x
+    elseif x < 7
+        est = 5.586330897230959 - 1.602979886180835*x +
+            0.37974476329853285*x^2 - 0.018643831481027707*x^3
+    elseif x < 15.5
+        est = -0.5497444945000789 + 0.989529954999804*x
+    else
+        est = 1.655516817740531 + 0.964440832317101*x
+    end
+    exp(est)
+end
