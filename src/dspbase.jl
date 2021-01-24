@@ -1505,13 +1505,16 @@ function _conv_alg_estimate_runtime(
     _, su = arr_a_info
     _, sv = arr_b_info
     x = log(prod(su) * prod(sv))
+    U = promote_type(S, T)
     if nt == 1
         if x < 7.5
             piecewise = 8.157646933454654 + 0.07844244759200057*x
         elseif x < 11
             piecewise = 8.34283 + 0.20827 * x - 0.06407 * x^2 + 0.006047 * x^3
-        else
+        elseif U <: Float64
             piecewise = -0.68556 + 1.04102 * x
+        else
+            piecewise = 0.943703385397019 + 0.8855520075473133 * x
         end
     else
         center_size = ntuple(i -> sv[i] == 0 ? su[i] :
@@ -1526,8 +1529,10 @@ function _conv_alg_estimate_runtime(
             piecewise = 9.457701766091818 + 0.07967585796608821*x -
                 0.07014518806614922*x^2 + 0.008745924358757803*x^3 -
                 0.00021177689617113388*x^4
-        else
+        elseif U <: Float64
             piecewise = -0.68556 + 1.04102 * x - log(nt)
+        else
+            piecewise = 0.943703385397019 + 0.8855520075473133 * x - log(nt)
         end
     end
     est = exp(piecewise)
@@ -1540,18 +1545,29 @@ function _conv_separable_vecs! end # wrapper for this
 function _conv_alg_estimate_runtime(
     ::Type{typeof(_conv_separable_vecs!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
-    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+    arr_b_info::Tuple{Vararg{Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}}}
 ) where {T, N, S, M}
     _, su = arr_a_info
-    _, sv = arr_b_info
-    x = log(prod(su) * sum(sv))
-    if x < 6.9
-        piecewise = 6.628205506599878 + 0.20478048024564485*x
-    elseif x < 10.3
-        piecewise = 11.300227136465342 - 1.2402974913689009*x +
-            0.12432588572995124*x^2 - 0.001825256238931861*x^3
+    vest = sum(map(x -> prod(x[1]), arr_b_info))
+    x = log(prod(su) * vest)
+    if nt > 1
+        if x < 8.13
+            piecewise = 8.655406015608069 + 0.06375781489417498*x
+        elseif x < 13.8
+            piecewise = 15.506609261573267 - 1.6511966864470278*x +
+                0.1307445789108441*x^2 - 0.0022128059253073104*x^3
+        else
+            piecewise = 2.0272886571731935 + 0.8053069087421076*x - log(nt)
+        end
     else
-        piecewise = 1.4272886571731935 + 0.8053069087421076*x
+        if x < 6.9
+            piecewise = 6.628205506599878 + 0.20478048024564485*x
+        elseif x < 10.3
+            piecewise = 11.300227136465342 - 1.2402974913689009*x +
+                0.12432588572995124*x^2 - 0.001825256238931861*x^3
+        else
+            piecewise = 1.4272886571731935 + 0.8053069087421076*x
+        end
     end
     est = exp(piecewise)
 end
@@ -1561,21 +1577,12 @@ function _conv_separable_arrs! end
 function _conv_alg_estimate_runtime(
     ::Type{typeof(_conv_separable_arrs!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
-    arr_b_info::Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}
+    arr_b_info::Tuple{Vararg{Tuple{Type{<:AbstractArray{S, M}}, NTuple{M, <:Integer}}}}
 ) where {T, N, S, M}
     _, su = arr_a_info
-    _, sv = arr_b_info
-    x = log(prod(su) * sum(sv))
+    vest = sum(map(x -> prod(x[1]), arr_b_info))
+    x = log(prod(su) * vest)
     if nt == 1
-        if x < 6.65
-            piecewise = 8.887908453439723 + 0.07853391894975105*x
-        elseif x < 12
-            piecewise = 13.049750432269299 - 1.2199537371993463*x +
-                0.10799374530648398*x^2 - 0.0010384971965576118*x^3
-        else
-            piecewise = 0.3340886884136683 + 0.9833063997593783*x
-        end
-    else
         if x < 8.3
             piecewise = 9.467030428280037 + 0.056982245763379985*x
         elseif x < 14.6
@@ -1584,9 +1591,19 @@ function _conv_alg_estimate_runtime(
         else
             piecewise = 0.6040886884136683 + 0.9833063997593783*x - log(nt)
         end
+    else
+        if x < 6.65
+            piecewise = 8.887908453439723 + 0.07853391894975105*x
+        elseif x < 12
+            piecewise = 13.049750432269299 - 1.2199537371993463*x +
+                0.10799374530648398*x^2 - 0.0010384971965576118*x^3
+        else
+            piecewise = 0.3340886884136683 + 0.9833063997593783*x
+        end
     end
     est = exp(piecewise)
 end
+
 function _conv_alg_estimate_runtime(
     ::Type{typeof(_conv_os!)}, nt::Integer,
     arr_a_info::Tuple{Type{<:AbstractArray{T, N}}, NTuple{N, <:Integer}},
@@ -1652,13 +1669,24 @@ function _conv_alg_estimate_runtime(
     _, su = arr_a_info
     _, sv = arr_b_info
     x = log(prod(su) * sum(sv))
-    if x < 3.2
-        piecewise = 3.8350440097252827 + 0.09207407962416803*x
-    elseif x < 7.5
-        piecewise = 3.9801175054732942 - 0.1083897233674473*x +
-            0.062238253279432415*x^2 - 2.9055628603501725e-5*x^3
+    if nt > 1
+        if x < 7.5
+           piecewise = 7.84954985959159 + 0.05624576482364748*x
+        elseif x < 12.9
+            piecewise = 6.906997845929671 + 0.6103480742481645*x -
+                0.09435014035216004*x^2 + 0.005310861829320662*x^3
+        else
+            piecewise = -0.5667804673384191 + 0.954962473944651*x - log(nt)
+        end
     else
-        piecewise = -0.5667804673384191 + 0.954962473944651*x
+        if x < 3.2
+            piecewise = 3.8350440097252827 + 0.09207407962416803*x
+        elseif x < 7.5
+            piecewise = 3.9801175054732942 - 0.1083897233674473*x +
+                0.062238253279432415*x^2 - 2.9055628603501725e-5*x^3
+        else
+            piecewise = -0.5667804673384191 + 0.954962473944651*x
+        end
     end
     est = exp(piecewise)
 end
@@ -1672,11 +1700,24 @@ function _conv_alg_estimate_runtime(
     _, su = arr_a_info
     _, sv = arr_b_info
     x = log(prod(su) * sum(sv))
-    if x < 3.2
-        piecewise = 3.8350440097252827 + 0.09207407962416803*x
-    elseif x < 7.5
+    if nt > 1
+        if x < 7.5
+            piecewise = 7.620706530380964 + 0.11435087177151888*x
+        elseif x < 14
+            piecewise = 9.574496705076928 - 0.5357399347907142*x +
+                0.05603933690349738*x^2 - 0.0003786233247744501*x^3
+        else
+            piecewise = 0.025137033553178895 + 0.9265694794362248*x - log(nt)
+        end
     else
-        piecewise = -0.2623613932525886 + 0.943819387724145*x
+        if x < 3.3
+            piecewise = 2.6238224348008132 + 0.559587481528284*x
+        elseif x < 7.5
+            piecewise = 3.5796112494373604 + 0.023456904012057956*x +
+                0.06460771277015115*x^2 - 0.0012325274460639473*x^3
+        else
+            piecewise = 0.025137033553178895 + 0.9265694794362248*x
+        end
     end
     est = exp(piecewise)
 end
