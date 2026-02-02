@@ -538,8 +538,8 @@ end
 
 # Assumes u is larger than, or the same size as, v
 # nfft should be greater than or equal to 2*sv-1
-function _conv_os!(out, u::AbstractArray{<:Any, N}, v, su, sv, sout, nffts;
-                   nt = 1) where N
+function _conv_os!(out, u::AbstractArray{<:Any, N}, v, su, sv, sout, nffts,
+                   outregion; nt = 1) where N
     u_start = first.(axes(u))
     out_axes = axes(out)
     out_start = first.(out_axes)
@@ -1206,6 +1206,24 @@ _conv_similar(u, v, outsize) = _conv_similar(u, outsize, axes(u), axes(v))
 function _conv!(out, u, v, su, sv, outsize)
     # TODO: Add spatial / time domain algorithm
     _conv_fft!(out, u, v, su, sv, outsize)
+end
+
+function full_outregion(axes_u::NormalAxes{N}, axes_v::NormalAxes{N}) where N
+    out_ndx_adj = ntuple(i -> 0, N)
+    outrange = ntuple(i -> OneTo(last(axes_u[i]) + last(axes_v[i]) - 1), N)
+    outrange, out_ndx_adj
+end
+
+function same_outregion(axes_u::NormalAxes{N}, axes_v::NormalAxes{N}) where N
+    out_ndx_adj = ntuple(i -> -div(last(axes_v[i]) - 1, 2), N)
+    outrange = ntuple(N) do i
+        -out_ndx_adj[i] + 1 : last(axes_u[i]) - out_ndx_adj[i]
+    end
+    out_ndx_adj, outrange
+end
+
+function valid_outregion(axes_u::NormalAxes{N}, axes_V::NormalAxes{N}) where N
+    out_ndx_adj = ntuple(i -> -(last(axes_v[i]) - 1), N)
 end
 
 # Does convolution, will not switch argument order
